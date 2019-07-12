@@ -6,17 +6,57 @@ import os
 import datetime
 import torch.utils.data.dataset
 import tqdm
+import random
+from PIL import Image
+import math
+from torch.optim import SGD
+from torchvision import transforms
 
 
 class DataLoader(torch.utils.data.dataset.Dataset):
-    def __init__(self):
-        pass
+    def __init__(self, data_path, is_val=False):
+        self.data_path = data_path
+        self.data1 = []
+        self.data2 = []
+
+        for tag in os.listdir(data_path):
+            if tag == '.DS_Store':
+                continue
+            for file in os.listdir(os.path.join(data_path, tag)):
+                if file == '.DS_Stroe':
+                    continue
+                self.data1.append(os.path.join(tag, file))
+                self.data2.append(os.path.join(tag, file))
+
+        random.shuffle(self.data1)
+        random.shuffle(self.data2)
+
+        if is_val:
+            self.data1 = random.sample(self.data1, int(len(self.data1) / 10))
+            self.data2 = random.sample(self.data2, len(self.data1))
+
+        print('Loaded %s images.' % str(len(self.data1)))
 
     def __getitem__(self, index):
-        pass
+        im1 = Image.open(os.path.join(self.data_path, self.data1[index]))
+        im2 = Image.open(os.path.join(self.data_path, self.data2[index]))
+
+        im1 = im1.convert('RGB')
+        im2 = im2.convert('RGB')
+
+        data_transforms = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+        im1 = data_transforms(im1)
+        im2 = data_transforms(im2)
+
+        return im1, im2
 
     def __len__(self):
-        return 0
+        return len(self.data1)
 
 
 class Trainer(object):
@@ -33,11 +73,27 @@ class Trainer(object):
         if not os.path.exists(self.out_path):
             os.makedirs(self.out_path)
 
+        self.log_train_headers = [
+            'epoch',
+            'iteration',
+            'train/loss',
+            'elapsed_time',
+        ]
+
+        if not os.path.exists(os.path.join(self.out_path, 'log_train.csv')):
+            with open(os.path.join(self.out_path, 'log_train.csv'), 'w') as f:
+                f.write(','.join(self.log_train_headers) + '\n')
+
+        self.epoch = 0
+        self.iteration = 0
+
     def recon_criterion(self, input, target):
         return torch.mean(torch.abs(input - target))
 
     def train_epoch(self):
         self.model.train()
+
+        epoch_loss = 0.
 
         for batch_idx, (x_a, x_b) in tqdm.tqdm(
                 enumerate(self.train_loader),
@@ -46,10 +102,16 @@ class Trainer(object):
                 ncols=80,
                 leave=False
         ):
+            iteration = batch_idx + self.epoch * len(self.train_loader)
+            if self.iteration != 0 and (iteration - 1) != self.iteration:
+                continue
+            self.iteration = iteration
+
             x_a = Variable(x_a)
             x_b = Variable(x_b)
 
-            x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon = self.model(x_a, x_b)
+            x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon, x_aba, x_bab = \
+                self.model(x_a, x_b)
 
             self.opt.zero_grad()
             # reconstruction loss
@@ -59,53 +121,82 @@ class Trainer(object):
             loss_gen_recon_s_b = self.recon_criterion(s_b_recon, s_b)
             loss_gen_recon_c_a = self.recon_criterion(c_a_recon, c_a)
             loss_gen_recon_c_b = self.recon_criterion(c_b_recon, c_b)
+            loss_gen_cycrecon_x_a = self.recon_criterion(x_aba, x_a)
+            loss_gen_cycrecon_x_b = self.recon_criterion(x_bab, x_b)
 
             loss_gen_total = loss_gen_recon_x_a \
                              + loss_gen_recon_x_b \
                              + loss_gen_recon_s_a \
                              + loss_gen_recon_s_b \
                              + loss_gen_recon_c_a \
-                             + loss_gen_recon_c_b
+                             + loss_gen_recon_c_b \
+                             + loss_gen_cycrecon_x_a \
+                             + loss_gen_cycrecon_x_b
 
             loss_gen_total.backward()
             self.opt.step()
 
+            epoch_loss += loss_gen_total.detach().cpu().numpy()
+
+            if self.iteration >= self.max_iter:
+                break
+
+        with open(os.path.join(self.out_path, 'log_train.csv'), 'a') as f:
+            elapsed_time = (datetime.datetime.now() - self.timestamp_start).total_seconds()
+            log = [self.epoch, self.iteration, epoch_loss, elapsed_time]
+            log = map(str, log)
+            f.write(','.join(log) + '\n')
+
     def train(self):
-        pass
+        max_epoch = int(math.ceil(1. * self.max_iter / len(self.train_loader)))
+        for epoch in tqdm.trange(self.epoch, max_epoch, desc='Train', ncols=80):
+            self.epoch = epoch
+            self.train_epoch()
+            assert self.model.training
 
 
 class Reconstructor(nn.Module):
     def __init__(self):
-        super(Reconstructor).__init__()
-        self.generator = AdaINGen()
+        super(Reconstructor, self).__init__()
+        params = {
+            'input_dim_a': 3,
+            'dim': 64,              # number of filters in the bottommost layer
+            'mlp_dim': 256,         # number of filters in MLP
+            'style_dim': 8,         # length of style code
+            'activ': 'relu',        # activation function [relu/lrelu/prelu/selu/tanh]
+            'n_downsample': 2,      # number of downsampling layers in content encoder
+            'n_res': 4,             # number of residual blocks in content encoder/decoder
+            'pad_type': 'reflect',  # padding type [zero/reflect]
+        }
+        self.gen_a = AdaINGen(input_dim=3, params=params)
+        self.gen_b = AdaINGen(input_dim=3, params=params)
 
     def recon_criterion(self, input, target):
         return torch.mean(torch.abs(input - target))
 
     def forward(self, x_a, x_b):
         # encode
-        c_a, s_a = self.generator.encode(x_a)
-        c_b, s_b = self.generator.encode(x_b)
+        c_a, s_a = self.gen_a.encode(x_a)
+        # c_b, s_b = self.gen_b.encode(x_b)
 
         # decode(within domain)
-        x_a_recon = self.generator.decode(c_a, s_a)
-        x_b_recon = self.generator.decode(c_b, s_b)
+        x_a_recon = self.gen_a.decode(c_a, s_a)
+        # x_b_recon = self.gen_b.decode(c_b, s_b)
 
         # decode(cross domain)
-        x_ba = self.generator.decode(c_b, s_a)
-        x_ab = self.generator.decode(c_a, s_b)
+        # x_ba = self.gen_a.decode(c_b, s_a)
+        # x_ab = self.gen_b.decode(c_a, s_b)
 
         # encode again
-        c_a_recon, s_a_recon = self.generator.encode(x_a_recon)
-        c_b_recon, s_b_recon = self.generator.encode(x_b_recon)
+        c_a_recon, s_a_recon = self.gen_a.encode(x_a_recon)
+        # c_b_recon, s_b_recon = self.gen_b.encode(x_b_recon)
 
-        return x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon
+        # decode again (if needed)
+        # x_aba = self.gen_a.decode(c_a_recon, s_a)
+        # x_bab = self.gen_b.decode(c_b_recon, s_b)
 
-
-
-
-
-
+        # return x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon, x_aba, x_bab
+        return x_a_recon, s_a, c_a, s_a_recon, c_a_recon
 
 
 ##################################################################################
@@ -677,3 +768,41 @@ class SpectralNorm(nn.Module):
     def forward(self, *args):
         self._update_u_v()
         return self.module.forward(*args)
+
+
+if __name__ == '__main__':
+    train_loader = torch.utils.data.DataLoader(
+        DataLoader(data_path='/Users/admin/Desktop/sop_retrieval-master/style_data_clean'),
+        batch_size=2,
+        shuffle=True
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        DataLoader(data_path='/Users/admin/Desktop/sop_retrieval-master/style_data_clean', is_val=True),
+        batch_size=2,
+        shuffle=True
+    )
+
+    model = Reconstructor()
+
+    # model = model.cuda()
+
+    opt = SGD(
+        model.parameters(),
+        lr=1e-4,
+        momentum=0.2
+    )
+
+    # train
+    trainer = Trainer(
+        model=model,
+        opt=opt,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        out_path='./log',
+        max_iter=10000
+    )
+
+    trainer.epoch = 0
+    trainer.iteration = 0
+    trainer.train()
