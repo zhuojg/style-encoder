@@ -177,26 +177,49 @@ class Reconstructor(nn.Module):
     def forward(self, x_a, x_b):
         # encode
         c_a, s_a = self.gen_a.encode(x_a)
-        # c_b, s_b = self.gen_b.encode(x_b)
+        c_b, s_b = self.gen_b.encode(x_b)
 
         # decode(within domain)
         x_a_recon = self.gen_a.decode(c_a, s_a)
-        # x_b_recon = self.gen_b.decode(c_b, s_b)
+        x_b_recon = self.gen_b.decode(c_b, s_b)
 
         # decode(cross domain)
-        # x_ba = self.gen_a.decode(c_b, s_a)
-        # x_ab = self.gen_b.decode(c_a, s_b)
+        x_ba = self.gen_a.decode(c_b, s_a)
+        x_ab = self.gen_b.decode(c_a, s_b)
+
+        # encode again
+        c_b_recon, s_a_recon = self.gen_a.encode(x_ba)
+        c_a_recon, s_b_recon = self.gen_b.encode(x_ab)
+
+        # decode again (if needed)
+        x_aba = self.gen_a.decode(c_a_recon, s_a)
+        x_bab = self.gen_b.decode(c_b_recon, s_b)
+
+        return x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon, x_aba, x_bab
+        # return x_a_recon, s_a, c_a, s_a_recon, c_a_recon
+
+    def reconstruct(self, im1, im2):
+        # encode
+        c_a, s_a = self.gen_a.encode(im1)
+        c_b, s_b = self.gen_b.encode(im2)
+
+        # decode(within domain)
+        x_a_recon = self.gen_a.decode(c_a, s_a)
+        x_b_recon = self.gen_b.decode(c_b, s_b)
+
+        # decode(cross domain)
+        x_ba = self.gen_a.decode(c_b, s_a)
+        x_ab = self.gen_b.decode(c_a, s_b)
 
         # encode again
         c_a_recon, s_a_recon = self.gen_a.encode(x_a_recon)
-        # c_b_recon, s_b_recon = self.gen_b.encode(x_b_recon)
+        c_b_recon, s_b_recon = self.gen_b.encode(x_b_recon)
 
         # decode again (if needed)
-        # x_aba = self.gen_a.decode(c_a_recon, s_a)
-        # x_bab = self.gen_b.decode(c_b_recon, s_b)
+        x_aba = self.gen_a.decode(c_a_recon, s_a)
+        x_bab = self.gen_b.decode(c_b_recon, s_b)
 
-        # return x_a_recon, x_b_recon, s_a, s_b, c_a, c_b, s_a_recon, s_b_recon, c_a_recon, c_b_recon, x_aba, x_bab
-        return x_a_recon, s_a, c_a, s_a_recon, c_a_recon
+        return x_a_recon, x_b_recon, x_ba, x_ab, x_aba, x_bab
 
 
 ##################################################################################
